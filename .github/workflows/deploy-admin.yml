@@ -1,0 +1,161 @@
+name: Deploy Admin to AWS EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Validate deployment secrets
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in EC2_HOST EC2_USER DEPLOY_PATH SSH_KEY KNOWN_HOSTS; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::$name is missing in this repository's production secrets."
+              exit 1
+            fi
+          done
+          if [[ "$EC2_HOST" =~ [[:space:]] || "$EC2_HOST" == *://* || "$EC2_HOST" == *'/'* || "$EC2_HOST" == *':'* ]]; then
+            echo '::error::EC2_HOST must be an IPv4 address or DNS hostname, without a scheme, port, path, or whitespace.'
+            exit 1
+          fi
+          if [[ ! "$EC2_USER" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then
+            echo '::error::EC2_USER is not a valid Linux username.'
+            exit 1
+          fi
+          if [[ "$DEPLOY_PATH" != /* || "$DEPLOY_PATH" == *$'\n'* || "$DEPLOY_PATH" == *$'\r'* ]]; then
+            echo '::error::DEPLOY_PATH must be the existing absolute Compose directory, on one line.'
+            exit 1
+          fi
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          ssh-keygen -y -P '' -f ~/.ssh/id_ed25519 > /dev/null || {
+            echo '::error::EC2_SSH_KEY must be a readable, unencrypted private key.'
+            exit 1
+          }
+
+      - name: Verify SSH host configuration
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! ssh-keygen -F "$EC2_HOST" -f ~/.ssh/known_hosts > /dev/null; then
+            echo '::error::No SSH host key entry matches EC2_HOST.'
+            exit 1
+          fi
+          echo 'Matching SSH host entry found.'
+
+      - name: Deploy admin to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Quote arguments for the remote shell, including paths containing spaces.
+          printf -v REMOTE_COMMAND 'bash -se -- %q %q' "$DEPLOY_PATH" "$SOURCE_REPOSITORY"
+
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" "$REMOTE_COMMAND" <<'EOF_REMOTE'
+          set -euo pipefail
+          DEPLOY_PATH="$1"
+          EXPECTED_REPOSITORY="$2"
+          ADMIN_SERVICE='mysafety-admin'
+
+          cd "$DEPLOY_PATH"
+          command -v python3 > /dev/null
+          command -v flock > /dev/null
+
+          # Add the identical lock to the backend workflow for cross-repository protection.
+          exec 9>"$HOME/.mysafety-deploy.lock"
+          flock -w 900 9
+
+          docker info > /dev/null
+          docker compose config -q
+
+          # Use the admin build path from the existing EC2 Compose configuration.
+          # The resolved configuration is piped to Python, not printed into the logs.
+          ADMIN_PATH="$(docker compose config --format json --no-env-resolution | python3 -c '
+          import json, sys
+          config = json.load(sys.stdin)
+          print(config["services"]["mysafety-admin"]["build"]["context"])
+          ')"
+          if [[ ! -d "$ADMIN_PATH" ]]; then
+            echo '::error::The admin Compose build context is not an existing local directory.'
+            exit 1
+          fi
+
+          # Prevent accidentally pulling the backend repository or deploying copied files.
+          ORIGIN="$(git -C "$ADMIN_PATH" remote get-url origin)"
+          ORIGIN="${ORIGIN%.git}"
+          case "${ORIGIN,,}" in
+            "https://github.com/${EXPECTED_REPOSITORY,,}"|"git@github.com:${EXPECTED_REPOSITORY,,}"|"ssh://git@github.com/${EXPECTED_REPOSITORY,,}") ;;
+            *)
+              echo '::error::The admin source folder must be a checkout of this workflow repository.'
+              exit 1
+              ;;
+          esac
+          git -C "$ADMIN_PATH" ls-files --error-unmatch package.json > /dev/null
+          if [[ -n "$(git -C "$ADMIN_PATH" status --porcelain --untracked-files=no)" ]]; then
+            echo '::error::Tracked files have local changes. Review and preserve them before deploying; nothing was reset.'
+            exit 1
+          fi
+
+          # Keep the existing Git update sequence, but update the admin checkout.
+          export GIT_TERMINAL_PROMPT=0
+          git -C "$ADMIN_PATH" fetch origin main
+          git -C "$ADMIN_PATH" switch main
+          git -C "$ADMIN_PATH" pull --ff-only origin main
+
+          # Keep the existing Compose project; rebuild/recreate only its admin service.
+          # Backend, Redis, and Nginx must already be running.
+          docker compose exec -T nginx nginx -t
+          docker compose up -d --no-deps --build \
+            --wait --wait-timeout 120 "$ADMIN_SERVICE"
+
+          # Refresh Nginx after the admin container may have changed IP address.
+          docker compose exec -T nginx nginx -t
+          docker compose exec -T nginx nginx -s reload
+          docker compose ps "$ADMIN_SERVICE"
+          echo "Admin checkout commit: $(git -C "$ADMIN_PATH" rev-parse --short HEAD)"
+          EOF_REMOTE
