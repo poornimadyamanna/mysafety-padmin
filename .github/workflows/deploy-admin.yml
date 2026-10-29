@@ -136,8 +136,22 @@ jobs:
               ;;
           esac
           git -C "$ADMIN_PATH" ls-files --error-unmatch package.json > /dev/null
-          if [[ -n "$(git -C "$ADMIN_PATH" status --porcelain --untracked-files=no)" ]]; then
-            echo '::error::Tracked files have local changes. Review and preserve them before deploying; nothing was reset.'
+          LOCAL_CHANGES="$(git -C "$ADMIN_PATH" status --porcelain --untracked-files=no)"
+
+          if [[ -n "$LOCAL_CHANGES" ]]; then
+            echo "::group::Changed tracked files on EC2"
+            printf '%s\n' "$LOCAL_CHANGES"
+            echo "::endgroup::"
+
+            echo "::group::Unstaged change summary"
+            git -C "$ADMIN_PATH" --no-pager diff --stat
+            echo "::endgroup::"
+
+            echo "::group::Staged change summary"
+            git -C "$ADMIN_PATH" --no-pager diff --cached --stat
+            echo "::endgroup::"
+
+            echo "::error::Local changes exist. Review the filenames above before deploying. Nothing was reset."
             exit 1
           fi
 
